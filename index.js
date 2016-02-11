@@ -98,7 +98,7 @@ module.exports = function (source, inputSourceMap) {
         }
 
         path = loaderUtils.stringifyRequest(self, provideMap[key]);
-        return source.replace(new RegExp(escapeRegExp(search), 'g'), key + '=require(' + path + ').' + key + ';');
+        return source.replace(new RegExp(escapeRegExp(search), 'g'), '__tempRequired = require(' + path + ').' + key + '; if(__tempRequired instanceof Function) { ' + key + ' = __tempRequired; } else { ' + key + ' = __merge(' + key + '|| {}, __tempRequired); }');
     }
 
     /**
