@@ -217,7 +217,9 @@ module.exports = function (source, inputSourceMap) {
             ].join('');
         });
 
-        return merge + "eval('" +  prefix.replace(/'/g, "\\'") + "');";
+        var ensureNamespaces = merge + "eval('" +  prefix.replace(/'/g, "\\'") + "');";
+        var newGoogDefine = "\ngoog.define=function(name, value) { goog.exportPath_(name.substring(5), value, goog); };";
+        return ensureNamespaces + newGoogDefine;
     }
 
     /**
