@@ -98,7 +98,11 @@ module.exports = function (source, inputSourceMap) {
         }
 
         path = loaderUtils.stringifyRequest(self, provideMap[key]);
-        return source.replace(new RegExp(escapeRegExp(search), 'g'), '__tempRequired = require(' + path + ').' + key + '; if(__tempRequired instanceof Function) { ' + key + ' = __tempRequired; } else { ' + key + ' = __merge(' + key + '|| {}, __tempRequired); }');
+        var namespaceKeys = ['bb.util', 'goog.dom', 'goog.userAgent'];
+        if (namespaceKeys.indexOf(key) > -1) {
+            return source.replace(new RegExp(escapeRegExp(search), 'g'), key + '=__merge(' + key + '|| {}, require(' + path + ').' + key + ');');
+        }
+        return source.replace(new RegExp(escapeRegExp(search), 'g'), key + '=require(' + path + ').' + key + ';');
     }
 
     /**
