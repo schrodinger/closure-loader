@@ -62,7 +62,7 @@ function resolveAndCacheDirectory(directory, watch) {
             return glob(path.join(directory, '/**/{*.js,*.jsx}'));
         })
         .map(function(filePath) {
-            if (filepath.includes('generated/bb')) {
+            if (filePath.includes('generated/bb')) {
                 return Promise.resolve([]);
             }
             return findProvideCalls(filePath);
