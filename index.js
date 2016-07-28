@@ -3,12 +3,17 @@ var loaderUtils = require("loader-utils"),
     mapBuilder = require('./dependencyMapBuilder'),
     SourceNode = require("source-map").SourceNode,
     SourceMapConsumer = require("source-map").SourceMapConsumer,
+
+    // Set collapsePrefixes to an Array of namespaces to collapse
+    // For example [''] will collapse variables from bb.app.etc to bb_app_etc
+    // This improves what UglifyJS can do when mangling
     defaultConfig = config = {
         paths: [],
         es6mode: false,
-        watch: true
+        watch: true,
+        collapsePrefixes: []
     },
-    prefix, postfix;
+    postfix;
 
 
 module.exports = function (source, inputSourceMap) {
@@ -16,8 +21,9 @@ module.exports = function (source, inputSourceMap) {
         query = loaderUtils.parseQuery(this.query),
         callback = this.async(),
         originalSource = source,
-        globalVars = [],
+        allCollapsedVars = [],
         exportedVars = [],
+        exportedCollapsedVars = [],
         config;
 
     this.cacheable && this.cacheable();
@@ -26,49 +32,84 @@ module.exports = function (source, inputSourceMap) {
 
     mapBuilder(config.paths, config.watch).then(function(provideMap) {
         var provideRegExp = /goog\.provide *?\((['"])(.*?)\1\);?/,
-            requireRegExp = /goog\.require *?\((['"])(.*?)\1\);?/,
-            globalVarTree = {},
+            requireRegExp = new RegExp('goog\\.require *?\\(([\'"])(.*?)\\1\\);?', 'g');
             exportVarTree = {},
             matches;
 
-        while (matches = provideRegExp.exec(source)) {
-            source = source.replace(new RegExp(escapeRegExp(matches[0]), 'g'), '');
-            globalVars.push(matches[2]);
-            exportedVars.push(matches[2]);
-        }
-
+        // Iterate through all goog.requires and collect the keys in order
+        // as well as a map from the key to the matched string
+        var requiredKeys = [];
+        var requiresMatchMap = {};
         while (matches = requireRegExp.exec(source)) {
-            globalVars.push(matches[2]);
-            source = replaceRequire(source, matches[2], matches[0], provideMap, exportedVars);
+            var requireKey = matches[2];
+            if (isCollapsiblePackage(requireKey)) {
+              allCollapsedVars.push(requireKey);
+            }
+            requiredKeys.push(requireKey);
+            requiresMatchMap[requireKey] = matches[0];
         }
 
-        globalVars = globalVars
-            .filter(deduplicate)
-            .map(buildVarTree(globalVarTree));
+        // Iterate through all goog.provides, and collect the keys to export.
+        // Remove all the provides, but if the key is collapsible, go ahead and declare a var for it
+        // Also if we have no requires, go ahead and ensure the exported keys namespace exists.
+        var createdNamespaces = ['goog'];
+        while (matches = provideRegExp.exec(source)) {
+            var provideKey = matches[2];
+            var replaceRegex = new RegExp(escapeRegExp(matches[0]), 'g');
+            var provideReplacement = '';
+
+            if (isCollapsiblePackage(provideKey)) {
+              allCollapsedVars.push(provideKey);
+              exportedCollapsedVars.push(provideKey);
+              var collapsedKey = getCollapsedKey(provideKey, provideMap);
+              provideReplacement = `var ${collapsedKey}={};`;
+            } else {
+              exportedVars.push(provideKey);
+              if (requiredKeys.length === 0) {
+                  provideReplacement = ensureNamespace(provideKey, createdNamespaces, false);
+              }
+            }
+            source = source.replace(replaceRegex, provideReplacement);
+        }
+
+        // For each goog.require replace with a CommonJS require.
+        // Also, after the last require, ensure all the namespaces for exported variables exist
+        requiredKeys.forEach(function (requireKey, index) {
+            var isLast = requiredKeys.length - 1 === index;
+            var additionalVars = isLast ? exportedVars : null;
+            source = replaceRequire(source, requireKey, requiresMatchMap[requireKey],
+                provideMap, createdNamespaces, additionalVars);
+        });
 
         exportedVars = exportedVars
             .filter(deduplicate)
             .filter(removeNested)
             .map(buildVarTree(exportVarTree));
 
-        prefix = createPrefix(globalVarTree);
-        postfix = createPostfix(exportVarTree, exportedVars, config);
+        // Sort all keys in reverse length so we replace the longer keys first to avoid replacing with the wrong value
+        // Then replace all usages of keys in source with their collapsed value
+        // e.g. If a file provides both bb.etc.Actions and bb.etc.Actions.EventType
+        // replace bb.etc.Actions.EventType first to avoid changing to bb_etc_Actions.EventType.BLAH
+        allCollapsedVars = allCollapsedVars.filter(deduplicate).sort(reverseKeyLengthComparator);
+        source = replaceWithCollapsedKeys(source, allCollapsedVars, provideMap);
+
+        exportedCollapsedVars = exportedCollapsedVars.filter(deduplicate);
+        postfix = createPostfix(exportVarTree, exportedVars, exportedCollapsedVars, config, provideMap);
 
         if(inputSourceMap) {
             var currentRequest = loaderUtils.getCurrentRequest(self),
                 node = SourceNode.fromStringWithSourceMap(originalSource, new SourceMapConsumer(inputSourceMap));
 
-            node.prepend(prefix + "\n");
             node.add(postfix);
             var result = node.toStringWithSourceMap({
                 file: currentRequest
             });
 
-            callback(null, prefix + "\n" + source + postfix, result.map.toJSON());
+            callback(null, source + postfix, result.map.toJSON());
             return;
         }
 
-        callback(null, prefix + "\n" + source + postfix, inputSourceMap);
+        callback(null, source + postfix, inputSourceMap);
     }).catch(function(error) {
       callback(error);
     });
@@ -83,24 +124,99 @@ module.exports = function (source, inputSourceMap) {
         return string.replace(/([.*+?^=!:${}()|\[\]\/\\])/g, "\\$1");
     }
 
-    function isParent(key, exportedVars) {
-        var isParent = false;
-        var isParentRegExp = new RegExp('^' + key.replace('.', '\\.', 'g'));
-        for (var i=0; i < exportedVars.length; i++) {
-            if (isParentRegExp.test(exportedVars[i])) return true;
+    /**
+     * Find the an ancestor namespace of the key which we've ensured exists.
+     * This should be the closest ancestor since we store these in an array as we create them
+     * and we never create a namespace without creating it's parent first
+     *
+     * @param {string} key
+     * @param {Array<string>} createdNamespaces
+     * @returns {string}
+     */
+    function findParent(key, createdNamespaces) {
+        for (var i=createdNamespaces.length-1; i >= 0; i--) {
+            if (key.startsWith(createdNamespaces[i] + '.')) return createdNamespaces[i];
         }
+        return null;
+    }
+
+    /**
+     * Return true if the key should be collapsed
+     *
+     * @param {string} key
+     * @returns {boolean}
+     */
+    function isCollapsiblePackage(key) {
+      return config.collapsePrefixes.some(function(prefix) {
+          return key.startsWith(prefix);
+      });
+    }
+
+    /**
+     * Return a collapsed key to represent a provide or require in our code
+     * NOTE (jordan) Keys for JSX file provides must be capitalized so React knows they're components
+     *
+     * @param {string} key
+     * @param {Object} provideMap
+     * @returns {string}
+     */
+    function getCollapsedKey(key, provideMap) {
+      var newKey = key.replace(/\./g, '_');
+      if (provideMap[key].endsWith('.jsx')) {
+        newKey = 'B' + newKey.substring(1);
+      }
+      return newKey;
+    }
+
+    /**
+     * A sort function for ordering keys in reverse order of length.
+     * We sort in reverse order so we replace something like goog.dom.query before we replace goog.dom
+     *
+     * @param {string} a
+     * @param {string} b
+     * @returns {number} comparison
+     */
+    function reverseKeyLengthComparator(a, b) {
+        return b.length - a.length;
+    }
+
+    /**
+     * Search through the source and replace any collapsible keys with their collapsed value.
+     * This doesn't replace cases where the key is in quotation marks
+     *
+     * @param {string} source
+     * @param {Array} allCollapsedVars
+     * @param {Object} provideMap
+     * @returns {string}
+     */
+    function replaceWithCollapsedKeys(source, allCollapsedVars, provideMap) {
+        allCollapsedVars.forEach(function (key) {
+            var collapsedKey = getCollapsedKey(key, provideMap);
+
+            // Search ensures we match a trailing character which is invalid in a variable name to avoid collisions
+            // We also don't match cases where the key is a string such as displayName fields
+            // NOTE (jordan) The trailing character regex is incomplete, but probably good enough
+            var search = new RegExp(escapeRegExp(key) + '([^\'"a-zA-Z0-9_\\$])', 'g');
+            source = source.replace(search, collapsedKey + '$1');
+        });
+        return source;
     }
 
     /**
      * Replace a given goog.require() with a CommonJS require() call.
+     * We also ensure the namespace for the key exists before the require.
+     * If additionalVars are passed in (as we do for the last require call), we ensure those vars
+     * namespaces exist after the require.
      *
      * @param {string} source
      * @param {string} key
      * @param {string} search
      * @param {Object} provideMap
+     * @param {Array<string>} createdNamespaces
+     * @param {Array<string>} additionalVars
      * @returns {string}
      */
-    function replaceRequire(source, key, search, provideMap, exportedVars) {
+    function replaceRequire(source, key, search, provideMap, createdNamespaces, additionalVars) {
         var replaceRegex = new RegExp(escapeRegExp(search), 'g');
         var path, requireString;
 
@@ -109,15 +225,65 @@ module.exports = function (source, inputSourceMap) {
         }
 
         path = loaderUtils.stringifyRequest(self, provideMap[key]);
-        requireString = 'require(' + path + ').' + key;
 
-        // if the required module is a parent of a provided module, use deepmerge so that injected
-        // namespaces are not overwritten
-        if (isParent(key, exportedVars)) {
-          return source.replace(replaceRegex, key + '=__merge(' + requireString + ', (' + key + ' || {}));');
-        } else {
-          return source.replace(replaceRegex, key + '=' + requireString + ';');
+        if (isCollapsiblePackage(key)) {
+            var collapsedKey = getCollapsedKey(key, provideMap);
+            var replacement = `var ${collapsedKey}=require(${path}).${collapsedKey};`;
+            return source.replace(replaceRegex, replacement);
         }
+
+        // If the required module has a parent module which was previously required,
+        // ensure injected namespaces in case they were overwritten
+        var prefixString = ensureNamespace(key, createdNamespaces, true);
+        createdNamespaces.push(key);
+
+        // If this is the last require let's check and make sure
+        // no provide injected namespaces were overwritten
+        var suffixString = '';
+        if (additionalVars) {
+            additionalVars.forEach(function (additionalVar) {
+                suffixString += ensureNamespace(additionalVar, createdNamespaces, false);
+            });
+        }
+
+        replaceString = `${prefixString}${key}=require(${path}).${key};${suffixString}`;
+        return source.replace(replaceRegex, replaceString);
+    }
+
+    /**
+     * Given a key and an array of created namespaces, create the namespace for the key if it doesn't exist.
+     *
+     * @param {string} key
+     * @param {Array<string>} createdNamespaces
+     * @param {boolean} removeLast
+     * @returns {string}
+     */
+    function ensureNamespace(key, createdNamespaces, removeLast) {
+      var ensureString = '';
+      if (createdNamespaces.indexOf(key) > -1) {
+        return ensureString;
+      }
+
+      var parent = findParent(key, createdNamespaces);
+      var neededNamespaces = key.split('.');
+      if (parent) {
+        neededNamespaces = key.replace(parent + '.', '').split('.');
+      }
+
+      if (removeLast) {
+        neededNamespaces.pop();
+      }
+      neededNamespaces.forEach(function(namespace) {
+          if (parent) {
+            parent = `${parent}.${namespace}`;
+            ensureString += `${parent}=${parent}||{};`;
+          } else {
+            parent = namespace;
+            ensureString += `var ${parent}=goog.global.${parent}=goog.global.${parent}||{};`;
+          }
+          createdNamespaces.push(parent);
+      });
+      return ensureString;
     }
 
     /**
@@ -184,10 +350,12 @@ module.exports = function (source, inputSourceMap) {
      *
      * @param {Object} exportVarTree
      * @param {Array} exportedVars
+     * @param {Array} exportedCollapsedVars
      * @param {Object} config
+     * @param {Object} provideMap
      * @returns {string}
      */
-    function createPostfix(exportVarTree, exportedVars, config) {
+    function createPostfix(exportVarTree, exportedVars, exportedCollapsedVars, config, provideMap) {
         postfix = ';';
         Object.keys(exportVarTree).forEach(function (rootVar) {
             var jsonObj;
@@ -196,43 +364,18 @@ module.exports = function (source, inputSourceMap) {
             postfix += 'exports.' + rootVar + '=' + jsonObj + ';';
         });
 
+        exportedCollapsedVars.forEach(function (key) {
+          var collapsedKey = getCollapsedKey(key, provideMap);
+          postfix += `exports.${collapsedKey}=${collapsedKey};`;
+        });
+
         if (config.es6mode && exportedVars.length) {
             postfix += 'exports.default=' + exportedVars.shift() + ';exports.__esModule=true;';
+        } else if (config.es6mode && exportedCollapsedVars.length) {
+            postfix += 'exports.default=' + getCollapsedKey(exportedCollapsedVars[0], provideMap) + ';exports.__esModule=true;';
         }
 
         return postfix;
-    }
-
-    /**
-     * Create a string to inject before the actual module code
-     *
-     * This will create all provided or required namespaces. It will merge those namespaces into an existing
-     * object if existent. The declarations will be executed via eval because other plugins or loaders like
-     * the ProvidePlugin will see that a variable is created and might not work as expected.
-     *
-     * Example: If you require or provide a namespace under 'goog' and have the closure library export
-     * its global goog object and use that via ProvidePlugin, the plugin wouldn't inject the goog variable
-     * into a module that creates its own goog variables. That's why it has to be executed in eval.
-     *
-     * @param globalVarTree
-     * @returns {string}
-     */
-    function createPrefix(globalVarTree) {
-        var merge = "var __merge=require(" + loaderUtils.stringifyRequest(self, require.resolve('deepmerge')) + ");";
-        prefix = '';
-        Object.keys(globalVarTree).forEach(function (rootVar) {
-            prefix += [
-                'var ',
-                rootVar,
-                '=__merge(',
-                rootVar,
-                '||{},',
-                JSON.stringify(globalVarTree[rootVar]),
-                ');'
-            ].join('');
-        });
-
-        return merge + "eval('" +  prefix.replace(/'/g, "\\'") + "');";
     }
 
     /**

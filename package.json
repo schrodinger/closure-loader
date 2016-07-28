@@ -1,6 +1,6 @@
 {
   "name": "closure-loader",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Webpack loader for google closure library dependencies",
   "main": "index.js",
   "scripts": {
@@ -22,7 +22,7 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "webpack": "^1.9.10"
+    "webpack": "*"
   },
   "dependencies": {
     "bluebird": "^3.4.1",
