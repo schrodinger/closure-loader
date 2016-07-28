@@ -7,16 +7,13 @@ var loaderUtils = require("loader-utils"),
         paths: [],
         es6mode: false,
         watch: true
-    },
-    prefix, postfix;
-
+    };
 
 module.exports = function (source, inputSourceMap) {
     var self = this,
         query = loaderUtils.parseQuery(this.query),
         callback = this.async(),
         originalSource = source,
-        exportedVars = [],
         config;
 
     this.cacheable && this.cacheable();
@@ -26,44 +23,42 @@ module.exports = function (source, inputSourceMap) {
     mapBuilder(config.paths, config.watch).then(function(provideMap) {
         var provideRegExp = /goog\.provide *?\((['"])(.*)\1\);?/,
             requireRegExp = /goog\.require *?\((['"])(.*)\1\);?/,
-            globalVarTree = {},
-            exportVarTree = {},
+            providesKeys = [],
+            requiresKeys = [],
+            allKeys = [],
             matches;
 
+
         while (matches = provideRegExp.exec(source)) {
-            source = source.replace(new RegExp(escapeRegExp(matches[0]), 'g'), '');
-            exportedVars.push(matches[2]);
+            providesKeys.push(matches[2]);
+            source = replaceProvide(source, matches[2], matches[0]);
         }
 
         while (matches = requireRegExp.exec(source)) {
-            source = replaceRequire(source, matches[2], matches[0], provideMap);
+            requiresKeys.push(matches[2]);
+            source = replaceRequire(source, matches[2], matches[0], provideMap, providesKeys);
         }
 
-        exportedVars = exportedVars
-            .filter(deduplicate);
-        exportedVars.forEach(buildVarTree(globalVarTree));
-        exportedVars = exportedVars
-            .filter(removeNested);
-        exportedVars.forEach(buildVarTree(exportVarTree));
-
-        prefix = createPrefix(globalVarTree);
-        postfix = createPostfix(exportVarTree, exportedVars, config);
+        providesKeys = providesKeys.filter(deduplicate).sort(reverseKeyLengthComparator);
+        requiresKeys = requiresKeys.filter(deduplicate);
+        var allKeys = requiresKeys.concat(providesKeys).sort(reverseKeyLengthComparator);
+        source = collapseKeys(source, allKeys);
+        var postfix = createPostfix(providesKeys, config);
 
         if(inputSourceMap) {
             var currentRequest = loaderUtils.getCurrentRequest(self),
                 node = SourceNode.fromStringWithSourceMap(originalSource, new SourceMapConsumer(inputSourceMap));
 
-            node.prepend(prefix + "\n");
             node.add(postfix);
             var result = node.toStringWithSourceMap({
                 file: currentRequest
             });
 
-            callback(null, prefix + "\n" + source + postfix, result.map.toJSON());
+            callback(null, source + postfix, result.map.toJSON());
             return;
         }
 
-        callback(null, prefix + "\n" + source + postfix, inputSourceMap);
+        callback(null, source + postfix, inputSourceMap);
     });
 
     /**
@@ -74,7 +69,17 @@ module.exports = function (source, inputSourceMap) {
      */
     function escapeRegExp(string) {
         return string.replace(/([.*+?^=!:${}()|\[\]\/\\])/g, "\\$1");
-    }
+    };
+
+    /**
+     * Return a collapsed key to represent a provide or require in our code
+     *
+     * @param {string} key
+     * @returns {string}
+     */
+    function getCollapsedKey(key) {
+      return key.replace(/\./g, '$');
+    };
 
     /**
      * Replace a given goog.require() with a CommonJS require() call.
@@ -83,21 +88,71 @@ module.exports = function (source, inputSourceMap) {
      * @param {string} key
      * @param {string} search
      * @param {Object} provideMap
+     * @param {Array<string>} providesKeys
      * @returns {string}
      */
-    function replaceRequire(source, key, search, provideMap) {
-        var path;
-
+    function replaceRequire(source, key, search, provideMap, providesKeys) {
         if (!provideMap[key]) {
             throw new Error("Can't find closure dependency " + key);
         }
 
-        path = loaderUtils.stringifyRequest(self, provideMap[key]);
-        var varTree = {};
-        buildVarTree(varTree)(key);
-        var ensureCommand = createPrefix(varTree);
-        return source.replace(new RegExp(escapeRegExp(search), 'g'), ensureCommand + key + '=require(' + path + ').' + key + ';');
-    }
+        var path = loaderUtils.stringifyRequest(self, provideMap[key]);
+        var collapsedKey = getCollapsedKey(key);
+        var replacement = `${collapsedKey}=require(${path}).${collapsedKey};`;
+
+        /*
+         * This shouldn't be necessary but is used where a closure file is missing a require
+         * e.g. they require goog.testing.TestCase, but not goog.testing.TestCase.Test
+         */
+        if(key === 'goog.testing.TestCase' &&
+                providesKeys.indexOf('goog.testing.ContinuationTestCase') > -1) {
+            var path = loaderUtils.stringifyRequest(self, provideMap['goog.testing.TestCase.Test']);
+            replacement += `goog$testing$TestCase.Test=require(${path}).goog$testing$TestCase$Test`;
+        }
+        return source.replace(new RegExp(escapeRegExp(search), 'g'), replacement);
+    };
+
+    /**
+     * Replace a given goog.provide() with line to ensure the collapsed key is initialized to an object.
+     *
+     * @param {string} source
+     * @param {string} key
+     * @param {string} search
+     * @returns {string}
+     */
+    function replaceProvide(source, key, search) {
+        var collapsedKey = getCollapsedKey(key);
+        var replacement = `var ${collapsedKey}={};`;
+
+        /*
+         * This shouldn't be necessary but is used where a closure file assumes a namespace exists due to a provide
+         * e.g. they provide goog.events.EventType but set private values on goog.events
+         */
+        if(key === 'goog.events.EventType') {
+            replacement += 'goog.events={}';
+        } else if(key === 'goog.html.SafeUrl') {
+          replacement += 'goog.html={}';
+        } else if(key === 'goog.dom.MultiRange') {
+          replacement += 'goog.dom={}';
+        }
+
+        return source.replace(new RegExp(escapeRegExp(search), 'g'), replacement);
+    };
+
+    /**
+     * Replace all provided and required keys with the collapsed version
+     *
+     * @param {string} source
+     * @param {!Array.<string>} allKeys
+     * @returns {string}
+     */
+    function collapseKeys(source, allKeys) {
+        allKeys.forEach(function (key) {
+            var collapsedKey = getCollapsedKey(key);
+            source = source.replace(new RegExp(escapeRegExp(key), 'g'), collapsedKey);
+        });
+        return source;
+    };
 
     /**
      * Array filter function to remove duplicates
@@ -109,50 +164,20 @@ module.exports = function (source, inputSourceMap) {
      */
     function deduplicate(key, idx, arr) {
         return arr.indexOf(key) === idx;
-    }
+    };
 
     /**
-     * Array filter function to remove vars which already have a parent exposed
+     * A sort function for ordering keys in reverse order of length.
+     * We sort in reverse order so we replace something like goog.dom.query before we replace goog.dom
      *
-     * Example: Remove a.b.c if a.b exists in the array
-     *
-     * @param {[type]} key [description]
-     * @param {[type]} idx [description]
-     * @param {[type]} arr [description]
-     *
-     * @returns {[type]} [description]
+     * @param {string} a
+     * @param {string} b
+     * @returns {number} comparison
      */
-    function removeNested(key, idx, arr) {
-        var foundParent = false;
+    function reverseKeyLengthComparator(a, b) {
+        return b.length - a.length;
+    };
 
-        key.split('.')
-            .forEach(function (subKey, subIdx, keyParts) {
-                var parentKey;
-                if(subIdx === (keyParts.length - 1)) return;
-                parentKey = keyParts.slice(0, subIdx + 1).join('.');
-                foundParent = foundParent || arr.indexOf(parentKey) >= 0;
-            });
-
-        return !foundParent;
-    }
-
-    /**
-     * Creates a function that extends an object based on an array of keys
-     *
-     * Example: `['abc.def', 'abc.def.ghi', 'jkl.mno']` will become `{abc: {def: {ghi: {}}, jkl: {mno: {}}}`
-     *
-     * @param {Object} tree - the object to extend
-     * @returns {Function} The filter function to be called in forEach
-     */
-    function buildVarTree(tree) {
-        return function (key) {
-            var layer = tree;
-            key.split('.').forEach(function (part) {
-                layer[part] = layer[part] || {};
-                layer = layer[part];
-            });
-        }
-    }
 
     /**
      * Create a string which will be injected after the actual module code
@@ -160,84 +185,21 @@ module.exports = function (source, inputSourceMap) {
      * This will create export statements for all provided namespaces as well as the default
      * export if es6mode is active.
      *
-     * @param {Object} exportVarTree
-     * @param {Array} exportedVars
+     * @param {Array} providesKeys
      * @param {Object} config
      * @returns {string}
      */
-    function createPostfix(exportVarTree, exportedVars, config) {
-        postfix = ';';
-        Object.keys(exportVarTree).forEach(function (rootVar) {
-            var jsonObj;
-            enrichExport(exportVarTree[rootVar], rootVar);
-            jsonObj = JSON.stringify(exportVarTree[rootVar]).replace(/(['"])%(.*?)%\1/g, '$2');
-            postfix += 'exports.' + rootVar + '=' + jsonObj + ';';
+    function createPostfix(providesKeys, config) {
+        var postfix = ';';
+        providesKeys.forEach(function (key) {
+            var collapsedKey = getCollapsedKey(key);
+            postfix += `exports.${collapsedKey}=${collapsedKey};`;
         });
 
-        if (config.es6mode && exportedVars.length) {
-            postfix += 'exports.default=' + exportedVars.shift() + ';exports.__esModule=true;';
+        if (config.es6mode && providesKeys.length) {
+            var collapsedKey = getCollapsedKey(providesKeys[0]);
+            postfix += `exports.default=${collapsedKey};exports.__esModule=true;`;
         }
-
         return postfix;
-    }
-
-    /**
-     * Create a string to inject before the actual module code
-     *
-     * @param varTree
-     * @returns {string}
-     */
-    function createPrefix(varTree) {
-        prefix = ensureVar(varTree, 'goog.global');
-        return prefix.join('');
-    }
-
-    /**
-     * @returns {!Array<string>} an array which can be joined to ensure a child var is defined on a parent var.
-     */
-    function ensureVar(parent, parentName) {
-      var script = [];
-      Object.keys(parent).forEach(function(childVar) {
-          var globalAssignment = [];
-          if (parentName === 'goog.global') {
-              globalAssignment = [
-                  childVar,
-                  '='
-              ];
-          }
-          script = script.concat(globalAssignment, [
-              parentName,
-              '.',
-              childVar,
-              '=',
-              parentName,
-              '.',
-              childVar,
-              '||{};'
-          ], ensureVar(parent[childVar], parentName + '.' + childVar));
-      });
-      return script;
     };
-
-    /**
-     * Replace all empty objects in an object tree with a special formatted string containing the path
-     * of that empty object in the tree
-     *
-     * Example: `{abc: {def: {}}}` will become `{abc: {def: "%abc.def%"}}`
-     *
-     * @param {Object} object - The object tree to enhance
-     * @param {string} path - The base path for the given object
-     */
-    function enrichExport(object, path) {
-        path = path ? path + '.' : '';
-        Object.keys(object).forEach(function (key) {
-            var subPath = path + key;
-
-            if (Object.keys(object[key]).length) {
-                enrichExport(object[key], subPath);
-            } else {
-                object[key] = '%' + subPath + '%';
-            }
-        });
-    }
 };
