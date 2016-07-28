@@ -37,13 +37,13 @@ module.exports = {
                 loaders: [
                     require.resolve('../../index'),
                 ],
-                exclude: [/base\.js$/],
+                exclude: [/google-closure-library\/closure\/goog\/base\.js$/],
             },
             // Loader for project js files
             {
                 test: /\/src\/.*\.js/,
                 loaders: [
-                    'closure',
+                    require.resolve('../../index'),
                 ],
                 exclude: [/node_modules/, /test/],
             },
