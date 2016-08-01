@@ -31,6 +31,15 @@ module.exports = function (source, inputSourceMap) {
     config = merge(defaultConfig, this.options[query.config || "closureLoader"], query);
 
     mapBuilder(config.paths, config.watch).then(function(provideMap) {
+        var commentedRequireRegExp = new RegExp('\\/\\/\\s*goog\\.require *?\\(([\'"])(.*?)\\1\\);?', 'g');
+        var commentedRequires = [];
+        while (commentedRequire = commentedRequireRegExp.exec(source)) {
+          commentedRequires.push(commentedRequire[0]);
+        }
+        if (commentedRequires.length > 0) {
+          throw new Error('Commented out goog.requires are not allowed ' + JSON.stringify(commentedRequires, undefined, 2));
+        }
+
         var provideRegExp = /goog\.provide *?\((['"])(.*?)\1\);?/,
             requireRegExp = new RegExp('goog\\.require *?\\(([\'"])(.*?)\\1\\);?', 'g');
             exportVarTree = {},
