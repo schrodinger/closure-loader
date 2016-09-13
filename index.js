@@ -205,8 +205,10 @@ module.exports = function (source, inputSourceMap) {
             // Search ensures we match a trailing character which is invalid in a variable name to avoid collisions
             // We also don't match cases where the key is a string such as displayName fields
             // NOTE (jordan) The trailing character regex is incomplete, but probably good enough
-            var search = new RegExp(escapeRegExp(key) + '([^\'"a-zA-Z0-9_\\$])', 'g');
-            source = source.replace(search, collapsedKey + '$1');
+            // NOTE (jordan) We also specifically handle the case of <namespace>.'
+            // for: http://opengrok/xref/seurat/SEURAT-JavaScript/dev/src/bb/util/proxies/AjaxProxy.js#115
+            var search = new RegExp(escapeRegExp(key) + '(?![\'"a-zA-Z0-9_\\$]|\\.\')', 'g');
+            source = source.replace(search, collapsedKey);
         });
         return source;
     }
