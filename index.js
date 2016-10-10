@@ -188,7 +188,7 @@ module.exports = function (source, inputSourceMap) {
      * @returns {string}
      */
     function createPostfix(exportVarTree, exportedVars, config) {
-        postfix = ';';
+        postfix = ';\n';
         Object.keys(exportVarTree).forEach(function (rootVar) {
             var jsonObj;
             enrichExport(exportVarTree[rootVar], rootVar);
