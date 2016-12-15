@@ -381,9 +381,9 @@ module.exports = function (source, inputSourceMap) {
         });
 
         if (config.es6mode && exportedVars.length) {
-            postfix += 'exports.default=' + exportedVars.shift() + ';exports.__esModule=true;';
+            postfix += 'exports.default=' + exportedVars.shift() + ';';
         } else if (config.es6mode && exportedCollapsedVars.length) {
-            postfix += 'exports.default=' + getCollapsedKey(exportedCollapsedVars[0], provideMap) + ';exports.__esModule=true;';
+            postfix += 'exports.default=' + getCollapsedKey(exportedCollapsedVars[0], provideMap) + ';';
         }
 
         return postfix;
