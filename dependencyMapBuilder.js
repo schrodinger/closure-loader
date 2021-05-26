@@ -57,7 +57,8 @@ function resolveAndCacheDirectory(directory, watch) {
         return cache[directory];
     }
 
-    cache[directory] = (watch ? createWatchPromise(directory) : Promise.resolve())
+    const toWatch = watch && !directory.includes('node_modules')
+    cache[directory] = (toWatch ? createWatchPromise(directory) : Promise.resolve())
         .then(function() {
             return glob(path.join(directory, '/**/{*.js,*.jsx}'));
         })
